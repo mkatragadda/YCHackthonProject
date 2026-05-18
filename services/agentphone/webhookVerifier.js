@@ -1,17 +1,21 @@
 /**
  * AgentPhone Webhook Signature Verifier
  *
- * AgentPhone sends:
- *   Header: x-webhook-signature: sha256=<hex>
- *   Header: x-webhook-timestamp: <unix seconds>
+ * AgentPhone signs webhooks using HMAC-SHA256 over the concatenation:
+ *   signedString = "{timestamp}.{rawBody}"
  *
- * Signing algorithm: HMAC-SHA256(secretKey, rawBody)
- *   where secretKey = base64-decode(AGENTPHONE_WEBHOOK_SECRET after stripping "whsec_" prefix)
+ * Headers sent by AgentPhone:
+ *   X-Webhook-Signature : sha256=<hex_digest>
+ *   X-Webhook-Timestamp : <unix seconds>
+ *   X-Webhook-ID        : <unique delivery id>
+ *   X-Webhook-Event     : <event type>
  *
- * Set SKIP_WEBHOOK_SIGNATURE=true to bypass for demo/development.
+ * Set SKIP_WEBHOOK_SIGNATURE=true to bypass for local development.
  */
 
 const crypto = require('crypto');
+
+const REPLAY_WINDOW_SECONDS = 300; // 5 minutes
 
 class WebhookVerifier {
   constructor() {
@@ -24,32 +28,20 @@ class WebhookVerifier {
 
     if (!raw) {
       console.warn('[WebhookVerifier] AGENTPHONE_WEBHOOK_SECRET not set');
-      this.secretRaw    = null;
-      this.secretBytes  = null;
-      this.secretStripped = null;
+      this.secret = null;
       return;
     }
 
-    // Variant 1: full raw secret as UTF-8 (e.g. "whsec_XOzx..." used as-is)
-    this.secretRaw = raw;
-
-    const b64 = raw.startsWith('whsec_') ? raw.slice(6) : raw;
-
-    // Variant 2: part after "whsec_" prefix as plain UTF-8 (not decoded)
-    this.secretStripped = Buffer.from(b64);
-
-    // Variant 3: base64-decode the part after "whsec_" prefix
-    try {
-      this.secretBytes = Buffer.from(b64, 'base64');
-    } catch {
-      this.secretBytes = null;
-    }
+    // Use secret as-is (plain UTF-8) — no base64 decoding
+    this.secret = raw;
+    console.log('[WebhookVerifier] Initialized: secret configured, length=' + raw.length);
   }
 
   /**
-   * Verify webhook from Next.js request.
-   * @param {Object} req            - Next.js request
-   * @param {string} rawBodyString  - Exact raw body string (bodyParser must be disabled)
+   * Verify an inbound AgentPhone webhook request.
+   * @param {Object} req           - Next.js request object
+   * @param {string} rawBodyString - Raw request body (bodyParser must be disabled)
+   * @returns {boolean}
    */
   verifyRequest(req, rawBodyString) {
     if (this.skip) {
@@ -57,57 +49,66 @@ class WebhookVerifier {
       return true;
     }
 
+    if (!this.secret) {
+      console.error('[WebhookVerifier] Cannot verify — AGENTPHONE_WEBHOOK_SECRET not set');
+      return false;
+    }
+
     const signatureHeader = req.headers['x-webhook-signature'];
+    const timestampHeader = req.headers['x-webhook-timestamp'];
 
     if (!signatureHeader) {
       console.error('[WebhookVerifier] Missing x-webhook-signature header');
-      console.error('[WebhookVerifier] All headers:', JSON.stringify(Object.keys(req.headers)));
+      return false;
+    }
+
+    if (!timestampHeader) {
+      console.error('[WebhookVerifier] Missing x-webhook-timestamp header');
+      return false;
+    }
+
+    // Reject stale webhooks (replay attack protection)
+    const timestamp = parseInt(timestampHeader, 10);
+    const now = Math.floor(Date.now() / 1000);
+    const age = now - timestamp;
+
+    if (isNaN(timestamp) || age > REPLAY_WINDOW_SECONDS || age < -60) {
+      console.error(`[WebhookVerifier] Timestamp rejected: age=${age}s (window=±${REPLAY_WINDOW_SECONDS}s)`);
       return false;
     }
 
     // Extract hex digest — supports "sha256=<hex>" and plain "<hex>"
-    let receivedDigest;
-    if (signatureHeader.includes('=')) {
-      const parts = signatureHeader.split('=');
-      receivedDigest = parts[parts.length - 1];
-    } else {
-      receivedDigest = signatureHeader;
-    }
+    const receivedDigest = signatureHeader.includes('=')
+      ? signatureHeader.split('=').slice(1).join('=')
+      : signatureHeader;
 
-    // Try all 3 key variants: raw UTF-8, stripped UTF-8 (no whsec_ prefix), base64-decoded
-    const rawKey = this.secretRaw ? Buffer.from(this.secretRaw) : null;
-    const matched = this._tryVerify(receivedDigest, rawBodyString, rawKey)
-                 || this._tryVerify(receivedDigest, rawBodyString, this.secretStripped)
-                 || this._tryVerify(receivedDigest, rawBodyString, this.secretBytes);
+    // Signed payload is: "{timestamp}.{rawBody}"
+    const signedString = `${timestampHeader}.${rawBodyString}`;
+    const computed = crypto
+      .createHmac('sha256', this.secret)
+      .update(signedString)
+      .digest('hex');
+
+    let matched = false;
+    try {
+      matched = crypto.timingSafeEqual(
+        Buffer.from(receivedDigest.toLowerCase(), 'hex'),
+        Buffer.from(computed, 'hex')
+      );
+    } catch {
+      matched = false;
+    }
 
     if (!matched) {
       console.error('[WebhookVerifier] Signature mismatch');
-      console.error('[WebhookVerifier] Received               :', receivedDigest);
-      console.error('[WebhookVerifier] Computed (raw key)     :', rawKey ? this._hmac(rawBodyString, rawKey) : 'N/A');
-      console.error('[WebhookVerifier] Computed (stripped key):', this.secretStripped ? this._hmac(rawBodyString, this.secretStripped) : 'N/A');
-      console.error('[WebhookVerifier] Computed (decoded key) :', this.secretBytes ? this._hmac(rawBodyString, this.secretBytes) : 'N/A');
+      console.error('[WebhookVerifier] Received :', receivedDigest);
+      console.error('[WebhookVerifier] Computed :', computed);
+      console.error('[WebhookVerifier] Timestamp:', timestampHeader);
     } else {
       console.log('[WebhookVerifier] ✓ Signature verified');
     }
 
     return matched;
-  }
-
-  _hmac(body, keyBuffer) {
-    return crypto.createHmac('sha256', keyBuffer).update(body).digest('hex');
-  }
-
-  _tryVerify(receivedHex, body, keyBuffer) {
-    if (!keyBuffer) return false;
-    try {
-      const computed = this._hmac(body, keyBuffer);
-      return crypto.timingSafeEqual(
-        Buffer.from(receivedHex.toLowerCase(), 'hex'),
-        Buffer.from(computed, 'hex')
-      );
-    } catch {
-      return false;
-    }
   }
 }
 
